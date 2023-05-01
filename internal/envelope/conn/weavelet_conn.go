@@ -20,6 +20,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"reflect"
 	"runtime/pprof"
 	"time"
 
@@ -98,10 +99,11 @@ func NewWeaveletConn(r io.ReadCloser, w io.WriteCloser, h WeaveletHandler) (*Wea
 	if wc.einfo.SelfKey != nil {
 		dialAddr = fmt.Sprintf("mtls://%s", dialAddr)
 	}
-	registered := codegen.Registered()
-	components := make([]string, len(registered))
-	for i, r := range registered {
-		components[i] = r.Name
+	components, edges, err := computeCallGraph()
+	if err != nil {
+		err := fmt.Errorf("error computing the call graph: %w", err)
+		wc.conn.cleanup(err)
+		return nil, err
 	}
 	wc.winfo = &protos.WeaveletInfo{
 		DialAddr: dialAddr,
@@ -112,6 +114,7 @@ func NewWeaveletConn(r io.ReadCloser, w io.WriteCloser, h WeaveletHandler) (*Wea
 			Patch: runtime.Patch,
 		},
 		Components: components,
+		CallEdges:  edges,
 	}
 	if err := wc.conn.send(&protos.WeaveletMsg{WeaveletInfo: wc.winfo}); err != nil {
 		return nil, err
@@ -339,6 +342,30 @@ func Profile(req *protos.GetProfileRequest) ([]byte, error) {
 		return nil, fmt.Errorf("unspecified profile collection type")
 	}
 	return buf.Bytes(), nil
+}
+
+func computeCallGraph() ([]string, []*protos.WeaveletInfo_CallEdge, error) {
+	all := codegen.Registered()
+	componentIndex := make(map[reflect.Type]int32, len(all))
+	components := make([]string, len(all))
+	for i, c := range all {
+		componentIndex[c.Iface] = int32(i)
+		components[i] = c.Name
+	}
+	allEdges := codegen.CallGraph()
+	edges := make([]*protos.WeaveletInfo_CallEdge, len(allEdges))
+	for i, edge := range allEdges {
+		callerIdx, ok := componentIndex[edge.Caller]
+		if !ok { // should never happen
+			return nil, nil, fmt.Errorf("invalid caller %v in call graph", edge.Caller)
+		}
+		calleeIdx, ok := componentIndex[edge.Callee]
+		if !ok { // should never happen
+			return nil, nil, fmt.Errorf("invalid callee %v in call graph", edge.Callee)
+		}
+		edges[i] = &protos.WeaveletInfo_CallEdge{Caller: callerIdx, Callee: calleeIdx}
+	}
+	return components, edges, nil
 }
 
 func listen(info *protos.EnvelopeInfo) (net.Listener, error) {

@@ -115,6 +115,10 @@ type handler struct {
 	g          *group
 	envelope   *envelope.Envelope
 	subscribed map[string]bool // routing info subscriptions, by component
+
+	// Map from a caller group to the list of components in this weavelet
+	// that the caller group is allowed to invoke methods on.
+	allowed map[string][]string
 }
 
 var _ envelope.EnvelopeHandler = &handler{}
@@ -299,8 +303,18 @@ func (d *deployer) startColocationGroup(g *group) error {
 		// Make sure the version of the deployer matches the version of the
 		// compiled binary.
 		wlet := e.WeaveletInfo()
-		if err := checkVersion(wlet.Version); err != nil {
-			return err
+
+		// Compute the map of callers that are allowed to invoke methods on
+		// this weavelet's components.
+		allowed := map[string][]string{}
+		for _, edge := range wlet.CallEdges {
+			callee := wlet.Components[edge.Callee]
+			if d.group(callee) != g { // callee component not in g
+				continue
+			}
+			caller := wlet.Components[edge.Caller]
+			callerGroup := d.group(caller).name
+			allowed[callerGroup] = append(allowed[callerGroup], callee)
 		}
 
 		d.running.Go(func() error {
@@ -309,6 +323,7 @@ func (d *deployer) startColocationGroup(g *group) error {
 				g:          g,
 				subscribed: map[string]bool{},
 				envelope:   e,
+				allowed:    allowed,
 			}
 			err := e.Serve(h)
 			d.stop(err)
@@ -321,25 +336,6 @@ func (d *deployer) startColocationGroup(g *group) error {
 			return err
 		}
 		g.envelopes = append(g.envelopes, e)
-	}
-	return nil
-}
-
-// checkVersion checks that the deployer API version the deployer was built
-// with is compatible with the deployer API version the app was built with,
-// erroring out if they are not compatible.
-func checkVersion(appVersion *protos.SemVer) error {
-	if appVersion == nil {
-		return fmt.Errorf("version mismatch: nil app version")
-	}
-	if appVersion.Major != runtime.Major ||
-		appVersion.Minor != runtime.Minor ||
-		appVersion.Patch != runtime.Patch {
-		return fmt.Errorf(
-			"version mismatch: deployer version %d.%d.%d is incompatible with app version %d.%d.%d.",
-			runtime.Major, runtime.Minor, runtime.Patch,
-			appVersion.Major, appVersion.Minor, appVersion.Patch,
-		)
 	}
 	return nil
 }
@@ -381,17 +377,18 @@ func (h *handler) subscribeTo(req *protos.ActivateComponentRequest) error {
 
 // VerifyClientCertificate implements the envelope.EnvelopeHandler interface.
 func (h *handler) VerifyClientCertificate(_ context.Context, req *protos.VerifyClientCertificateRequest) (*protos.VerifyClientCertificateReply, error) {
-	_, err := h.verifyCertificate(req.CertChain)
+	clientGroup, err := h.verifyCertificate(req.CertChain)
 	if err != nil {
 		return nil, err
 	}
 
-	// For now, return all components.
-	// TODO(spetrovic): Use the call graph to return the set of components
-	// that the client group is allowed to invoke methods on.
-	return &protos.VerifyClientCertificateReply{
-		Components: h.envelope.WeaveletInfo().Components,
-	}, nil
+	// Find which weavelet components the client is allowed to call.
+	allowed := h.allowed[clientGroup.name]
+	if allowed == nil {
+		return nil, fmt.Errorf("client group %q is not authorized to invoke any component methods in the group %q", clientGroup.name, h.g.name)
+	}
+
+	return &protos.VerifyClientCertificateReply{Components: allowed}, nil
 }
 
 // VerifyServerCertificate implements the envelope.EnvelopeHandler interface.
@@ -402,34 +399,29 @@ func (h *handler) VerifyServerCertificate(_ context.Context, req *protos.VerifyS
 	}
 
 	// Find the expected group name for the target component.
-	expected, ok := h.colocation[req.TargetComponent]
-	if !ok {
-		expected = req.TargetComponent
-	}
-	if expected != actual {
-		return nil, fmt.Errorf("invalid server identity for target component %s: want %q, got %q", req.TargetComponent, expected, actual)
+	expected := h.group(req.TargetComponent)
+	if expected.name != actual.name {
+		return nil, fmt.Errorf("invalid server identity for target component %s: want %q, got %q", req.TargetComponent, expected.name, actual.name)
 	}
 	return &protos.VerifyServerCertificateReply{}, nil
 }
 
-func (h *handler) verifyCertificate(certChain [][]byte) (string, error) {
+func (h *handler) verifyCertificate(certChain [][]byte) (*group, error) {
 	if n := len(certChain); n != 1 {
-		return "", fmt.Errorf("invalid cert chain length: want 1, got %d", n)
+		return nil, fmt.Errorf("invalid cert chain length: want 1, got %d", n)
 	}
 	names, err := certs.VerifySignedCert(certChain[0], h.caCert)
 	if err != nil {
-		return "", fmt.Errorf("cannot verify the cert: %w", err)
+		return nil, fmt.Errorf("cannot verify the cert: %w", err)
 	}
 	if len(names) != 1 {
-		return "", fmt.Errorf("invalid cert: expected a single name, got %v", names)
+		return nil, fmt.Errorf("invalid cert: expected a single name, got %v", names)
 	}
-
 	name := names[0]
-	_, ok := h.groups[name]
-	if !ok {
-		return "", fmt.Errorf("invalid cert: expected a group name, got %v", name)
+	if name == "" {
+		return nil, fmt.Errorf("empty group name %q in cert", name)
 	}
-	return name, nil
+	return h.group(name), nil
 }
 
 func (d *deployer) activateComponent(req *protos.ActivateComponentRequest) error {

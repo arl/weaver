@@ -388,6 +388,7 @@ github.com/ServiceWeaver/weaver/internal/envelope/conn
     io
     net
     os
+    reflect
     runtime/pprof
     sync
     time
